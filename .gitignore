@@ -1,0 +1,28 @@
+# Large model files
+*.safetensors
+*.bin
+*.pth
+
+# Model directories
+Qwen2.5-3B-Instruct/
+checkpoints/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs
+runs/
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+
+# Node modules (if any)
+node_modules/

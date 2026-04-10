@@ -1,0 +1,431 @@
+﻿import importlib.util
+import io
+import os
+import re
+from typing import Dict, List, Optional, Tuple
+from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+# Word 文档解析依赖（可选）
+try:
+    import docx  # python-docx
+except Exception:  # pragma: no cover
+    docx = None
+# PDF 解析依赖（可选）
+try:
+    from pypdf import PdfReader  # type: ignore
+except Exception:  # pragma: no cover
+    PdfReader = None
+# Excel 解析依赖（可选）
+try:
+    import pandas as pd  # type: ignore
+except Exception:  # pragma: no cover
+    pd = None
+# HuggingFace/BERT 依赖（可选）
+try:
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer  # type: ignore
+    import torch  # type: ignore
+except Exception:  # pragma: no cover
+    AutoModelForSequenceClassification = None
+    AutoTokenizer = None
+    torch = None
+
+# LLM 模型依赖（可选）
+try:
+    from llm_model import get_classifier
+    LLM_AVAILABLE = True
+except Exception:  # pragma: no cover
+    LLM_AVAILABLE = False
+# -----------------------------
+# 应用初始化
+# -----------------------------
+app = FastAPI(title="Finance Classifier API")
+# 允许本地开发：前端(5173) -> 后端(8000)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+# -----------------------------
+# 规则基线关键词
+# -----------------------------
+COMMODITY_KEYWORDS = [
+    "大宗商品",
+    "黄金",
+    "原油",
+    "铜",
+    "铁矿",
+    "煤炭",
+    "玉米",
+    "大豆",
+    "棉花",
+    "螺纹钢",
+    "现货",
+    "期货",
+    "库存",
+    "价格",
+    "报价",
+    "品种",
+    "供需",
+    "仓单",
+    "升贴水",
+    "进口",
+    "出口",
+    "炼厂",
+    "指数",
+]
+FINANCE_KEYWORDS = [
+    "金融",
+    "咨询",
+    "研报",
+    "宏观",
+    "通胀",
+    "利率",
+    "美元",
+    "汇率",
+    "信用",
+    "风险",
+    "债券",
+    "股票",
+    "基金",
+    "期权",
+    "期货",
+    "指数",
+    "供给",
+    "需求",
+    "库存",
+    "价格",
+    "成本",
+]
+POSITIVE_WORDS = ["上涨", "走强", "利好", "增产", "盈利", "改善", "回升", "突破", "需求上升"]
+NEGATIVE_WORDS = ["下跌", "走弱", "利空", "减产", "亏损", "恶化", "回落", "跌破", "需求下降"]
+# -----------------------------
+# 模型封装（支持扩展）
+# -----------------------------
+class ModelWrapper:
+    """
+    模型加载顺序：
+    1) 自定义 Python 模型文件（MODEL_PATH 指向 .py）
+    2) HuggingFace/BERT 目录（MODEL_PATH 指向模型目录）
+    3) 规则基线兜底
+    适配“模型文件 + 权重文件”的交付方式。
+    """
+    def __init__(self, model_path: Optional[str], weights_path: Optional[str]):
+        self.model_path = model_path
+        self.weights_path = weights_path
+        self.available = False
+        self.load_error: Optional[str] = None
+        self.model = None
+        self.tokenizer = None
+        self._load_model()
+    def _load_model(self) -> None:
+        if not self.model_path:
+            return
+        if not os.path.exists(self.model_path):
+            self.load_error = f"model_path_not_found: {self.model_path}"
+            return
+        # 1) 自定义 Python 文件：load_model(weights_path) 或 Model(weights_path)
+        ext = os.path.splitext(self.model_path)[1].lower()
+        if ext == ".py":
+            try:
+                spec = importlib.util.spec_from_file_location("custom_model", self.model_path)
+                if spec is None or spec.loader is None:
+                    self.load_error = "import_failed: invalid spec"
+                    return
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                if hasattr(module, "load_model"):
+                    self.model = module.load_model(self.weights_path)
+                elif hasattr(module, "Model"):
+                    self.model = module.Model(self.weights_path)
+                else:
+                    self.load_error = "custom_model_missing: load_model() or Model"
+                    return
+                self.available = True
+                return
+            except Exception as exc:
+                self.load_error = f"custom_model_error: {exc}"
+                return
+        # 2) HuggingFace 目录（BERT 等），需安装 transformers
+        #    扩展点：如果你们的 BERT 是目录形式，直接在这里加载
+        if os.path.isdir(self.model_path) and AutoModelForSequenceClassification is not None:
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(self.model_path)
+                self.model = AutoModelForSequenceClassification.from_pretrained(self.model_path)
+                self.available = True
+                return
+            except Exception as exc:
+                self.load_error = f"hf_load_error: {exc}"
+                return
+        self.load_error = "unsupported_model_file: use .py or HF directory"
+    def _predict_hf(self, text: str) -> Dict[str, float]:
+        # HuggingFace 预测（此处仅返回 raw 概率，映射逻辑需按任务自定义）
+        # 扩展点：在这里把 logits/probs 转成 “商品类/情感” 对应的概率
+        assert self.model is not None and self.tokenizer is not None and torch is not None
+        inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+        with torch.no_grad():
+            logits = self.model(**inputs).logits.squeeze(0)
+        probs = torch.softmax(logits, dim=-1).tolist()
+        return {"probs": probs}
+    def predict(self, text: str) -> Tuple[Dict[str, float], Dict[str, float], List[str], Dict]:
+        # 优先级：1) LLM 模型 2) 自定义模型 3) HuggingFace 模型 4) 规则基线
+
+        # 1) 尝试使用 LLM 模型
+        if LLM_AVAILABLE:
+            try:
+                llm_classifier = get_classifier()
+                if llm_classifier.model is not None:
+                    llm_result = llm_classifier.predict(text)
+                    # LLM 模型返回了结果
+                    if "error" not in llm_result.get("debug", {}):
+                        return (
+                            llm_result["product_label"],
+                            llm_result["sentiment_label"],
+                            llm_result["keywords"],
+                            llm_result["debug"]
+                        )
+            except Exception as exc:
+                # LLM 出错，继续尝试其他方法
+                pass
+
+        # 2) 尝试使用自定义/HuggingFace 模型
+        if self.available and self.model is not None:
+            try:
+                if self.tokenizer is not None:
+                    hf = self._predict_hf(text)
+                    product_label, sentiment_label, keywords, debug = rule_based_predict(text)
+                    debug["hf_probs"] = hf.get("probs", [])
+                    debug["model_mode"] = "hf"
+                    return product_label, sentiment_label, keywords, debug
+                result = self.model.predict(text)
+                product_label = normalize_binary_label(result.get("product_label", {}))
+                sentiment_label = normalize_sentiment_label(result.get("sentiment_label", {}))
+                keywords = list(result.get("keywords", []))[:8]
+                debug = {"model_mode": "custom_model"}
+                return product_label, sentiment_label, keywords, debug
+            except Exception as exc:
+                self.load_error = f"infer_error: {exc}"
+
+        # 3) 兜底使用规则基线
+        product_label, sentiment_label, keywords, debug = rule_based_predict(text)
+        debug["model_mode"] = "rule_based"
+        if self.load_error:
+            debug["model_error"] = self.load_error
+        return product_label, sentiment_label, keywords, debug
+# -----------------------------
+# 规则基线工具方法
+# -----------------------------
+def clamp(value: float, min_v: float = 0.0, max_v: float = 1.0) -> float:
+    return max(min_v, min(max_v, value))
+def normalize_binary_label(label: Dict[str, float]) -> Dict[str, float]:
+    product = float(label.get("商品类", 0.0))
+    non_product = float(label.get("非商品类", 0.0))
+    total = product + non_product
+    if total <= 0:
+        return {"商品类": 0.0, "非商品类": 0.0}
+    return {"商品类": product / total, "非商品类": non_product / total}
+def normalize_sentiment_label(label: Dict[str, float]) -> Dict[str, float]:
+    pos = float(label.get("正向", 0.0))
+    neu = float(label.get("中性", 0.0))
+    neg = float(label.get("负向", 0.0))
+    total = pos + neu + neg
+    if total <= 0:
+        return {"正向": 0.0, "中性": 0.0, "负向": 0.0}
+    return {"正向": pos / total, "中性": neu / total, "负向": neg / total}
+def count_hits(text: str, keywords: List[str]) -> int:
+    return sum(text.count(k) for k in keywords)
+def extract_keywords(text: str, limit: int = 8) -> List[str]:
+    hits = {}
+    for word in COMMODITY_KEYWORDS + FINANCE_KEYWORDS:
+        count = text.count(word)
+        if count > 0:
+            hits[word] = count
+    if hits:
+        return [k for k, _ in sorted(hits.items(), key=lambda x: (-x[1], -len(x[0]), x[0]))][
+            :limit
+        ]
+    candidates = re.findall(r"[\u4e00-\u9fff]{2,6}", text)
+    freq: Dict[str, int] = {}
+    for token in candidates:
+        freq[token] = freq.get(token, 0) + 1
+    if not freq:
+        return []
+    return [k for k, _ in sorted(freq.items(), key=lambda x: (-x[1], -len(x[0]), x[0]))][
+        :limit
+    ]
+def rule_based_predict(text: str) -> Tuple[Dict[str, float], Dict[str, float], List[str], Dict]:
+    product_hits = count_hits(text, COMMODITY_KEYWORDS)
+    finance_hits = count_hits(text, FINANCE_KEYWORDS)
+    score = clamp(0.2 + 0.25 * product_hits + 0.1 * finance_hits, 0.0, 1.0)
+    product_prob = clamp(score, 0.05, 0.95)
+    product_label = {"商品类": product_prob, "非商品类": 1.0 - product_prob}
+    pos = count_hits(text, POSITIVE_WORDS)
+    neg = count_hits(text, NEGATIVE_WORDS)
+    if pos == 0 and neg == 0:
+        sentiment_label = {"正向": 0.2, "中性": 0.6, "负向": 0.2}
+    else:
+        diff = pos - neg
+        strength = clamp(abs(diff) / max(pos + neg, 1), 0.2, 0.8)
+        if diff > 0:
+            sentiment_label = {
+                "正向": 0.5 + strength / 2,
+                "中性": 0.3 - strength / 4,
+                "负向": 0.2 - strength / 4,
+            }
+        elif diff < 0:
+            sentiment_label = {
+                "正向": 0.2 - strength / 4,
+                "中性": 0.3 - strength / 4,
+                "负向": 0.5 + strength / 2,
+            }
+        else:
+            sentiment_label = {"正向": 0.3, "中性": 0.4, "负向": 0.3}
+        sentiment_label = normalize_sentiment_label(sentiment_label)
+    keywords = extract_keywords(text, limit=8)
+    debug = {
+        "product_hits": product_hits,
+        "finance_hits": finance_hits,
+        "sentiment_pos": pos,
+        "sentiment_neg": neg,
+    }
+    return product_label, sentiment_label, keywords, debug
+def pick_main_label(probs: Dict[str, float]) -> Tuple[str, float]:
+    if not probs:
+        return "-", 0.0
+    label, value = sorted(probs.items(), key=lambda x: (-x[1], x[0]))[0]
+    return label, float(value)
+def build_response(
+    product_label: Dict[str, float],
+    sentiment_label: Dict[str, float],
+    keywords: List[str],
+    debug: Dict,
+    preview: Optional[Dict[str, List]] = None,
+) -> Dict:
+    main_product_label, main_product_conf = pick_main_label(product_label)
+    main_sentiment_label, main_sentiment_conf = pick_main_label(sentiment_label)
+    return {
+        "classification": {"label": main_product_label, "confidence": main_product_conf},
+        "sentiment": {"label": main_sentiment_label, "score": round(main_sentiment_conf * 100, 2)},
+        "keywords": keywords,
+        "product_label": product_label,
+        "sentiment_label": sentiment_label,
+        "preview": preview,
+        "debug": debug,
+    }
+# -----------------------------
+# 文件解析
+# -----------------------------
+def read_file_text(file: UploadFile) -> Tuple[str, Optional[str], Optional[Dict[str, List]]]:
+    # 读取 txt/csv/docx/pdf/xlsx/xls 为纯文本，并提供 Excel 预览
+    if file is None:
+        return "", None, None
+    filename = file.filename or ""
+    ext = os.path.splitext(filename)[1].lower()
+    if ext in [".txt", ".csv"]:
+        data = file.file.read()
+        try:
+            return data.decode("utf-8"), None, None
+        except Exception:
+            return data.decode("gbk", errors="ignore"), None, None
+    if ext == ".docx":
+        if docx is None:
+            return "", "docx_missing_dependency", None
+        try:
+            data = file.file.read()
+            document = docx.Document(io.BytesIO(data))
+            text = "\n".join(p.text for p in document.paragraphs if p.text)
+            return text, None, None
+        except Exception as exc:
+            return "", f"docx_read_error: {exc}", None
+    if ext == ".pdf":
+        if PdfReader is None:
+            return "", "pdf_missing_dependency", None
+        try:
+            data = file.file.read()
+            reader = PdfReader(io.BytesIO(data))
+            pages = []
+            for page in reader.pages:
+                pages.append(page.extract_text() or "")
+            text = "\n".join(pages).strip()
+            return text, None, None
+        except Exception as exc:
+            return "", f"pdf_read_error: {exc}", None
+    if ext in [".xlsx", ".xls"]:
+        if pd is None:
+            return "", "excel_missing_dependency", None
+        try:
+            data = file.file.read()
+            df = pd.read_excel(io.BytesIO(data))
+            df = df.fillna("")
+            preview_rows = df.head(5).astype(str).values.tolist()
+            preview = {"columns": [str(c) for c in df.columns], "rows": preview_rows}
+            text = df.head(200).astype(str).to_csv(index=False)
+            return text, None, preview
+        except Exception as exc:
+            return "", f"excel_read_error: {exc}", None
+    return "", "unsupported_file", None
+# -----------------------------
+# API 接口
+# -----------------------------
+MODEL = ModelWrapper(os.getenv("MODEL_PATH"), os.getenv("WEIGHTS_PATH"))
+class TextAnalyzeRequest(BaseModel):
+    text: str
+    model_version: Optional[str] = None
+@app.post("/api/v1/analyze/text")
+async def analyze_text(payload: TextAnalyzeRequest = Body(...)):
+    text = (payload.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="empty_text")
+    product_label, sentiment_label, keywords, debug = MODEL.predict(text)
+    debug.update({"text_length": len(text), "model_loaded": MODEL.available})
+    return build_response(product_label, sentiment_label, keywords, debug)
+@app.post("/api/v1/analyze/file")
+async def analyze_file(file: UploadFile = File(...), model_version: str | None = Form(None)):
+    _ = model_version
+    filename = file.filename or ""
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in [".pdf", ".xlsx", ".xls", ".docx"]:
+        raise HTTPException(status_code=400, detail="unsupported_file")
+    file_text, file_error, preview = read_file_text(file)
+    if file_error:
+        raise HTTPException(status_code=400, detail=file_error)
+    if not file_text.strip():
+        raise HTTPException(status_code=400, detail="empty_file_text")
+    product_label, sentiment_label, keywords, debug = MODEL.predict(file_text)
+    debug.update(
+        {"text_length": len(file_text), "model_loaded": MODEL.available, "file_name": file.filename}
+    )
+    return build_response(product_label, sentiment_label, keywords, debug, preview=preview)
+@app.post("/api/predict")
+async def predict(text: str = Form(""), file: UploadFile | None = File(None)):
+    # 兼容旧版接口：单条预测入口
+    if not text and file is None:
+        return {
+            "product_label": {"商品类": 0.0, "非商品类": 0.0},
+            "sentiment_label": {"正向": 0.0, "中性": 0.0, "负向": 0.0},
+            "keywords": [],
+            "debug": {"error": "empty_input"},
+        }
+    file_text, file_error, _preview = ("", None, None)
+    if file is not None:
+        file_text, file_error, _preview = read_file_text(file)
+    merged_text = (text or "").strip()
+    if file_text:
+        merged_text = (merged_text + "\n" + file_text).strip()
+    if not merged_text:
+        return {
+            "product_label": {"商品类": 0.0, "非商品类": 0.0},
+            "sentiment_label": {"正向": 0.0, "中性": 0.0, "负向": 0.0},
+            "keywords": [],
+            "debug": {"error": file_error or "unsupported_file"},
+        }
+    product_label, sentiment_label, keywords, debug = MODEL.predict(merged_text)
+    debug.update({"text_length": len(merged_text), "model_loaded": MODEL.available})
+    return {
+        "product_label": product_label,
+        "sentiment_label": sentiment_label,
+        "keywords": keywords,
+        "debug": debug,
+    }
