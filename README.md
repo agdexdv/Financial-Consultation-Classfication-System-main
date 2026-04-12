@@ -1,6 +1,7 @@
 ﻿# 金融咨询分类辅助系统
 
-本项目采用 **React 静态前端 + FastAPI 后端** 架构，提供金融咨询文本的分类与情感分析能力。
+本项目采用 **React 静态前端 + FastAPI 后端** 架构，面向金融文本分类与情感分析场景。
+模型路线统一为 **Qwen2.5-Instruct + LoRA 多标签分类**；当前仓库默认使用规则基线完成接口联调与页面演示，待 GPU / 推理资源满足后再启用 Qwen2.5 + LoRA 在线推理。
 
 ## 页面功能（已对照 PRD 更新）
 
@@ -24,6 +25,8 @@
   - `frontend/vite.config.js`  代理 `/api` 到后端
 - `backend/`  FastAPI
   - `backend/app.py`  接口与推理逻辑（含模型扩展入口）
+  - `backend/llm_model.py`  Qwen2.5-Instruct + LoRA 推理适配
+  - `backend/LLM/`  LoRA 训练、评估与数据处理脚本
   - `backend/requirements.txt`  后端依赖
 - `README.md`  项目说明
 
@@ -60,20 +63,20 @@ npm run dev
 ```json
 {
   "text": "受美联储加息影响，今日国际金价下跌...",
-  "model_version": "bert-base-finetuned-v1"
+  "model_version": "qwen2.5-instruct-lora"
 }
 ```
 
 **Response (JSON)**
 ```json
 {
-  "classification": {"label": "黄金", "confidence": 0.98},
-  "sentiment": {"label": "negative", "score": 85},
-  "keywords": ["美联储", "加息", "金价"],
-  "product_label": {"黄金": 0.92, "原油": 0.03, "螺纹钢": 0.02},
-  "sentiment_label": {"正向": 0.1, "中性": 0.2, "负向": 0.7},
+  "classification": {"label": "能源", "confidence": 0.92},
+  "sentiment": {"label": "负向", "score": 85},
+  "keywords": ["市场", "能源", "消极"],
+  "product_label": {"金属": 0.02, "煤炭": 0.03, "农业": 0.01, "能源": 0.92, "畜牧": 0.02},
+  "sentiment_label": {"正向": 0.05, "中性": 0.10, "负向": 0.85},
   "preview": null,
-  "debug": {"text_length": 120, "model_loaded": false}
+  "debug": {"text_length": 120, "model_loaded": false, "model_mode": "rule_based"}
 }
 ```
 
@@ -89,66 +92,51 @@ npm run dev
 
 - `POST /api/predict`：保留旧版接口，仍支持 `text` + `file` 组合。
 
-## 模型接入（重点）
+## 模型方案（重点）
 
-模型微调后可能产出：**一个模型文件 + 一个权重文件**。后端已预留扩展入口，位置在：
+本项目的模型路线已经统一为 **Qwen2.5-Instruct + LoRA 多标签分类**，不再把 BERT 或其他通用分类模型作为主路线说明。
 
-- `backend/app.py` -> `ModelWrapper` 类
-- `backend/app.py` -> `_load_model()` 和 `_predict_hf()`
+- `backend/LLM/`：LoRA 训练、评估、数据处理脚本
+- `backend/llm_model.py`：Qwen2.5-Instruct + LoRA 推理适配
+- `backend/app.py`：统一对外 API 与规则基线 / LoRA 推理切换入口
 
-### 方案 A：自定义 Python 模型文件（推荐）
+### 当前运行状态
 
-设置环境变量：
-- `MODEL_PATH`：模型 Python 文件路径（`.py`）
-- `WEIGHTS_PATH`：权重路径
+- 当前仓库默认使用规则基线返回结果，方便前后端联调与轻量演示
+- `Qwen2.5-Instruct + LoRA` 推理代码已集成，但默认关闭
+- 关闭原因是本地在线推理需要较高 GPU 显存与运行资源
+- 资源条件满足后，可在 `backend/llm_model.py` 中启用 LoRA 推理逻辑
 
-模型文件需提供：
+### 当前接口与模型关系
 
-```python
-def load_model(weights_path):
-    return MyModel(weights_path)
-
-class MyModel:
-    def predict(self, text):
-        return {
-            "product_label": {"黄金": 0.92, "原油": 0.03, "螺纹钢": 0.02},
-            "sentiment_label": {"正向": 0.6, "中性": 0.3, "负向": 0.1},
-            "keywords": ["原油", "价格"],
-        }
-```
-
-### 方案 B：HuggingFace/BERT 目录（多分类输出）
-
-如果模型侧产出的是 BERT 等 HuggingFace 目录：
-
-- 将 `MODEL_PATH` 指向模型目录
-- 安装额外依赖（按需）：`transformers` 和 `torch`
-
-**推荐输出格式（多分类商品）：**
-- 模型输出 `logits/probs` 对应商品类别列表（如 `黄金/原油/螺纹钢/...`）
-- 后端将其映射为 `product_label: {label: prob}`
-- `classification` 使用最高概率作为主类别
-
-你可以在 `backend/app.py` 的 `_predict_hf()` 与 `predict()` 中完成“概率 -> 标签”的映射。
+- 接口层仍统一返回 `classification / sentiment / product_label / sentiment_label / keywords`
+- 当启用 Qwen2.5 + LoRA 推理后，后端会把多标签输出整理为前端当前可消费的结构
+- 当前 `model_version` 主要作为版本标识，不影响默认规则基线流程
 
 ## Pending Items（模型侧）
 
-1. **BERT 多分类微调与输出**
-- 需要模型侧提供商品类别的多分类输出（label -> prob）
-- 需要提供 label mapping 列表与推理输出格式
-- 若仅有“商品类/非商品类”二分类，前端无法展示具体商品名称
+1. **Qwen2.5-Instruct + LoRA 在线推理启用**
+- 需要在具备足够 GPU 资源的环境中启用推理加载
+- 需要补齐生产环境的推理配置与部署方式
 
-2. **情感输出规范化**
+2. **多标签输出与前端展示对齐**
+- 需要明确多标签结果如何映射到当前前端卡片结构
+- 若前端后续直接展示完整标签集合，可进一步扩展返回字段
+
+3. **情感输出规范化**
 - 需要明确情感标签集合与顺序（正/中/负）
 - 需要给出 score 的含义范围（0-1 or 0-100）
 
-3. **实体高亮（可选高级功能）**
+4. **实体高亮（可选高级功能）**
 - 若希望在原文中高亮实体，模型需返回 span 位置信息
 
 ### Impact on UI
-- **无多分类输出时**：
-  - “商品分类”卡片只能展示“商品类/非商品类”
-  - 多标签列表无法显示具体商品
+- **未启用 LoRA 在线推理时**：
+  - 当前结果主要来自规则基线
+  - 多标签语义能力与上下文理解能力有限
+- **多标签映射未完全打通时**：
+  - 前端只能展示整理后的主标签与概率分布
+  - 完整标签集合需要额外字段或新的展示组件
 - **缺少情感规范时**：
   - 情感强度条可能显示不准确
 - **无实体 span 时**：

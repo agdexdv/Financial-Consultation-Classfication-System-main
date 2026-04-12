@@ -332,7 +332,7 @@ function App() {
       const response = await fetch("/api/v1/analyze/text", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, model_version: "bert-base-finetuned-v1" }),
+        body: JSON.stringify({ text, model_version: "qwen2.5-instruct-lora" }),
       });
 
       if (!response.ok) {
@@ -381,7 +381,7 @@ function App() {
       xhr.onerror = () => reject(new Error("网络错误"));
       const formData = new FormData();
       formData.append("file", file);
-      formData.append("model_version", "bert-base-finetuned-v1");
+      formData.append("model_version", "qwen2.5-instruct-lora");
       xhr.send(formData);
     });
   }
@@ -814,7 +814,7 @@ function App() {
 
           {loading ? (
             <div className="skeleton">
-              <div className="skeleton-title">BERT 模型正在推理中...</div>
+              <div className="skeleton-title">Qwen2.5 + LoRA 模型正在推理中...</div>
               <div className="skeleton-grid">
                 <div className="skeleton-card" />
                 <div className="skeleton-card" />

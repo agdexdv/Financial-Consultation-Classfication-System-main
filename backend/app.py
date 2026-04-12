@@ -21,7 +21,7 @@ try:
     import pandas as pd  # type: ignore
 except Exception:  # pragma: no cover
     pd = None
-# HuggingFace/BERT 依赖（可选）
+# 历史兼容的 HuggingFace 分类模型依赖（可选，当前非主路线）
 try:
     from transformers import AutoModelForSequenceClassification, AutoTokenizer  # type: ignore
     import torch  # type: ignore
@@ -108,7 +108,7 @@ class ModelWrapper:
     """
     模型加载顺序：
     1) 自定义 Python 模型文件（MODEL_PATH 指向 .py）
-    2) HuggingFace/BERT 目录（MODEL_PATH 指向模型目录）
+    2) 历史兼容的 HuggingFace 分类模型目录（MODEL_PATH 指向模型目录）
     3) 规则基线兜底
     适配“模型文件 + 权重文件”的交付方式。
     """
@@ -148,8 +148,8 @@ class ModelWrapper:
             except Exception as exc:
                 self.load_error = f"custom_model_error: {exc}"
                 return
-        # 2) HuggingFace 目录（BERT 等），需安装 transformers
-        #    扩展点：如果你们的 BERT 是目录形式，直接在这里加载
+        # 2) 历史兼容的 HuggingFace 分类模型目录，需安装 transformers
+        #    当前项目主路线为 Qwen2.5 + LoRA；如需兼容旧模型，可在这里加载
         if os.path.isdir(self.model_path) and AutoModelForSequenceClassification is not None:
             try:
                 self.tokenizer = AutoTokenizer.from_pretrained(self.model_path)
