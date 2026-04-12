@@ -101,6 +101,19 @@ FINANCE_KEYWORDS = [
 ]
 POSITIVE_WORDS = ["上涨", "走强", "利好", "增产", "盈利", "改善", "回升", "突破", "需求上升"]
 NEGATIVE_WORDS = ["下跌", "走弱", "利空", "减产", "亏损", "恶化", "回落", "跌破", "需求下降"]
+MULTILABEL_KEYWORDS = {
+    "国际": ["国际", "全球", "海外", "美国", "欧洲", "欧盟", "日本", "美联储", "美元"],
+    "经济活动": ["经济", "GDP", "就业", "消费", "制造业", "工业", "投资", "通胀", "PMI"],
+    "市场": ["市场", "价格", "报价", "期货", "现货", "指数", "交易", "收盘", "行情"],
+    "金属": ["金属", "黄金", "白银", "铜", "铝", "锌", "镍", "钢", "螺纹钢", "铁矿"],
+    "政策": ["政策", "监管", "央行", "财政", "会议", "公告", "法案", "关税", "降准", "加息"],
+    "煤炭": ["煤炭", "动力煤", "焦煤", "焦炭", "喷吹煤"],
+    "农业": ["农业", "农产品", "玉米", "大豆", "小麦", "棉花", "豆粕", "油脂"],
+    "能源": ["能源", "原油", "石油", "天然气", "电力", "燃料", "新能源", "光伏", "风电"],
+    "畜牧": ["畜牧", "生猪", "猪肉", "鸡蛋", "饲料", "养殖", "白羽鸡", "仔猪"],
+    "政治": ["政治", "政府", "总统", "大选", "外交", "冲突", "战争", "议会", "制裁"],
+}
+SENTIMENT_TO_MULTILABEL = {"正向": "积极", "中性": "中立", "负向": "消极"}
 # -----------------------------
 # 模型封装（支持扩展）
 # -----------------------------
@@ -169,7 +182,7 @@ class ModelWrapper:
             logits = self.model(**inputs).logits.squeeze(0)
         probs = torch.softmax(logits, dim=-1).tolist()
         return {"probs": probs}
-    def predict(self, text: str) -> Tuple[Dict[str, float], Dict[str, float], List[str], Dict]:
+    def predict(self, text: str) -> Tuple[Dict[str, float], Dict[str, float], List[str], Dict, List[str]]:
         # 优先级：1) LLM 模型 2) 自定义模型 3) HuggingFace 模型 4) 规则基线
 
         # 1) 尝试使用 LLM 模型
@@ -184,7 +197,8 @@ class ModelWrapper:
                             llm_result["product_label"],
                             llm_result["sentiment_label"],
                             llm_result["keywords"],
-                            llm_result["debug"]
+                            llm_result["debug"],
+                            list(llm_result.get("labels", []))[:8],
                         )
             except Exception as exc:
                 # LLM 出错，继续尝试其他方法
@@ -195,25 +209,26 @@ class ModelWrapper:
             try:
                 if self.tokenizer is not None:
                     hf = self._predict_hf(text)
-                    product_label, sentiment_label, keywords, debug = rule_based_predict(text)
+                    product_label, sentiment_label, keywords, debug, labels = rule_based_predict(text)
                     debug["hf_probs"] = hf.get("probs", [])
                     debug["model_mode"] = "hf"
-                    return product_label, sentiment_label, keywords, debug
+                    return product_label, sentiment_label, keywords, debug, labels
                 result = self.model.predict(text)
                 product_label = normalize_binary_label(result.get("product_label", {}))
                 sentiment_label = normalize_sentiment_label(result.get("sentiment_label", {}))
                 keywords = list(result.get("keywords", []))[:8]
+                labels = list(result.get("labels", []))[:8] or derive_multilabels(text, sentiment_label)
                 debug = {"model_mode": "custom_model"}
-                return product_label, sentiment_label, keywords, debug
+                return product_label, sentiment_label, keywords, debug, labels
             except Exception as exc:
                 self.load_error = f"infer_error: {exc}"
 
         # 3) 兜底使用规则基线
-        product_label, sentiment_label, keywords, debug = rule_based_predict(text)
+        product_label, sentiment_label, keywords, debug, labels = rule_based_predict(text)
         debug["model_mode"] = "rule_based"
         if self.load_error:
             debug["model_error"] = self.load_error
-        return product_label, sentiment_label, keywords, debug
+        return product_label, sentiment_label, keywords, debug, labels
 # -----------------------------
 # 规则基线工具方法
 # -----------------------------
@@ -255,7 +270,30 @@ def extract_keywords(text: str, limit: int = 8) -> List[str]:
     return [k for k, _ in sorted(freq.items(), key=lambda x: (-x[1], -len(x[0]), x[0]))][
         :limit
     ]
-def rule_based_predict(text: str) -> Tuple[Dict[str, float], Dict[str, float], List[str], Dict]:
+def derive_multilabels(text: str, sentiment_label: Dict[str, float]) -> List[str]:
+    labels: List[str] = []
+    for label, keywords in MULTILABEL_KEYWORDS.items():
+        if count_hits(text, keywords) > 0:
+            labels.append(label)
+
+    if not any(label in labels for label in ["国际", "经济活动", "市场", "政策"]):
+        if count_hits(text, COMMODITY_KEYWORDS) > 0 or count_hits(text, FINANCE_KEYWORDS) > 0:
+            labels.append("市场")
+
+    if not labels and count_hits(text, FINANCE_KEYWORDS) > 0:
+        labels.append("经济活动")
+
+    if sentiment_label:
+        sentiment_main = sorted(sentiment_label.items(), key=lambda x: (-x[1], x[0]))[0][0]
+        sentiment_tag = SENTIMENT_TO_MULTILABEL.get(sentiment_main)
+        if sentiment_tag and sentiment_tag not in labels:
+            labels.append(sentiment_tag)
+
+    if not labels:
+        labels.append("未知")
+
+    return labels[:8]
+def rule_based_predict(text: str) -> Tuple[Dict[str, float], Dict[str, float], List[str], Dict, List[str]]:
     product_hits = count_hits(text, COMMODITY_KEYWORDS)
     finance_hits = count_hits(text, FINANCE_KEYWORDS)
     score = clamp(0.2 + 0.25 * product_hits + 0.1 * finance_hits, 0.0, 1.0)
@@ -290,7 +328,9 @@ def rule_based_predict(text: str) -> Tuple[Dict[str, float], Dict[str, float], L
         "sentiment_pos": pos,
         "sentiment_neg": neg,
     }
-    return product_label, sentiment_label, keywords, debug
+    labels = derive_multilabels(text, sentiment_label)
+    debug["labels_source"] = "rule_based"
+    return product_label, sentiment_label, keywords, debug, labels
 def pick_main_label(probs: Dict[str, float]) -> Tuple[str, float]:
     if not probs:
         return "-", 0.0
@@ -301,6 +341,7 @@ def build_response(
     sentiment_label: Dict[str, float],
     keywords: List[str],
     debug: Dict,
+    labels: Optional[List[str]] = None,
     preview: Optional[Dict[str, List]] = None,
 ) -> Dict:
     main_product_label, main_product_conf = pick_main_label(product_label)
@@ -308,6 +349,7 @@ def build_response(
     return {
         "classification": {"label": main_product_label, "confidence": main_product_conf},
         "sentiment": {"label": main_sentiment_label, "score": round(main_sentiment_conf * 100, 2)},
+        "labels": labels or [],
         "keywords": keywords,
         "product_label": product_label,
         "sentiment_label": sentiment_label,
@@ -378,9 +420,9 @@ async def analyze_text(payload: TextAnalyzeRequest = Body(...)):
     text = (payload.text or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="empty_text")
-    product_label, sentiment_label, keywords, debug = MODEL.predict(text)
+    product_label, sentiment_label, keywords, debug, labels = MODEL.predict(text)
     debug.update({"text_length": len(text), "model_loaded": MODEL.available})
-    return build_response(product_label, sentiment_label, keywords, debug)
+    return build_response(product_label, sentiment_label, keywords, debug, labels=labels)
 @app.post("/api/v1/analyze/file")
 async def analyze_file(file: UploadFile = File(...), model_version: str | None = Form(None)):
     _ = model_version
@@ -393,16 +435,17 @@ async def analyze_file(file: UploadFile = File(...), model_version: str | None =
         raise HTTPException(status_code=400, detail=file_error)
     if not file_text.strip():
         raise HTTPException(status_code=400, detail="empty_file_text")
-    product_label, sentiment_label, keywords, debug = MODEL.predict(file_text)
+    product_label, sentiment_label, keywords, debug, labels = MODEL.predict(file_text)
     debug.update(
         {"text_length": len(file_text), "model_loaded": MODEL.available, "file_name": file.filename}
     )
-    return build_response(product_label, sentiment_label, keywords, debug, preview=preview)
+    return build_response(product_label, sentiment_label, keywords, debug, labels=labels, preview=preview)
 @app.post("/api/predict")
 async def predict(text: str = Form(""), file: UploadFile | None = File(None)):
     # 兼容旧版接口：单条预测入口
     if not text and file is None:
         return {
+            "labels": [],
             "product_label": {"商品类": 0.0, "非商品类": 0.0},
             "sentiment_label": {"正向": 0.0, "中性": 0.0, "负向": 0.0},
             "keywords": [],
@@ -416,14 +459,16 @@ async def predict(text: str = Form(""), file: UploadFile | None = File(None)):
         merged_text = (merged_text + "\n" + file_text).strip()
     if not merged_text:
         return {
+            "labels": [],
             "product_label": {"商品类": 0.0, "非商品类": 0.0},
             "sentiment_label": {"正向": 0.0, "中性": 0.0, "负向": 0.0},
             "keywords": [],
             "debug": {"error": file_error or "unsupported_file"},
         }
-    product_label, sentiment_label, keywords, debug = MODEL.predict(merged_text)
+    product_label, sentiment_label, keywords, debug, labels = MODEL.predict(merged_text)
     debug.update({"text_length": len(merged_text), "model_loaded": MODEL.available})
     return {
+        "labels": labels,
         "product_label": product_label,
         "sentiment_label": sentiment_label,
         "keywords": keywords,

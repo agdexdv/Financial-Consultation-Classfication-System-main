@@ -12,6 +12,7 @@ const emptyResult = {
   sentiment: { label: "-", score: 0 },
   product_label: { "商品类": 0, "非商品类": 0 },
   sentiment_label: { "正向": 0, "中性": 0, "负向": 0 },
+  labels: [],
   keywords: [],
   preview: null,
   debug: {},
@@ -21,6 +22,9 @@ const SENTIMENT_LABELS = {
   positive: "正向",
   negative: "负向",
   neutral: "中性",
+  "积极": "正向",
+  "消极": "负向",
+  "中立": "中性",
   "正向": "正向",
   "负向": "负向",
   "中性": "中性",
@@ -61,6 +65,7 @@ function normalizeResponse(data = {}) {
     ...emptyResult,
     product_label: data.product_label || emptyResult.product_label,
     sentiment_label: data.sentiment_label || emptyResult.sentiment_label,
+    labels: Array.isArray(data.labels) ? data.labels : [],
     keywords: data.keywords || [],
     preview: data.preview || null,
     debug: data.debug || {},
@@ -522,6 +527,15 @@ function App() {
   }, [result]);
 
   const recentHistory = useMemo(() => history.slice(0, 3), [history]);
+  const labelsNote = useMemo(() => {
+    if (!result.labels?.length) {
+      return "";
+    }
+    if (result.debug?.model_mode === "rule_based") {
+      return "当前展示的是规则基线推断标签，用于前端演示。";
+    }
+    return "";
+  }, [result]);
   const showOverview = mode === "file" && resultsList.length && resultView === "overview";
   const overviewJson = useMemo(
     () =>
@@ -899,6 +913,18 @@ function App() {
                     </div>
                     <SentimentMeter label={mainSentiment[0]} score={result.sentiment?.score || 0} />
                   </div>
+                </div>
+
+                <div className="result-section">
+                  <div className="result-section-title">多标签结果</div>
+                  <div className="keywords multi-labels">
+                    {result.labels.length ? (
+                      result.labels.map((item) => <span key={item}>{item}</span>)
+                    ) : (
+                      <span className="empty">暂无多标签结果</span>
+                    )}
+                  </div>
+                  {labelsNote ? <div className="helper-note">{labelsNote}</div> : null}
                 </div>
 
                 <div className="result-section">
