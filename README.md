@@ -62,7 +62,7 @@ npm run dev
 **Request (JSON)**
 ```json
 {
-  "text": "受美联储加息影响，今日国际金价下跌...",
+  "text": "受美联储加息影响，今日国际黄金价格下跌。",
   "model_version": "qwen2.5-instruct-lora"
 }
 ```
@@ -70,13 +70,23 @@ npm run dev
 **Response (JSON)**
 ```json
 {
-  "classification": {"label": "能源", "confidence": 0.92},
-  "sentiment": {"label": "负向", "score": 85},
-  "keywords": ["市场", "能源", "消极"],
-  "product_label": {"金属": 0.02, "煤炭": 0.03, "农业": 0.01, "能源": 0.92, "畜牧": 0.02},
-  "sentiment_label": {"正向": 0.05, "中性": 0.10, "负向": 0.85},
+  "classification": {"label": "商品类", "confidence": 0.7999999999999999},
+  "sentiment": {"label": "负向", "score": 90.0},
+  "labels": ["国际", "市场", "金属", "政策", "消极"],
+  "keywords": ["价格", "黄金"],
+  "product_label": {"商品类": 0.7999999999999999, "非商品类": 0.20000000000000007},
+  "sentiment_label": {"正向": 0.0, "中性": 0.09999999999999998, "负向": 0.9},
   "preview": null,
-  "debug": {"text_length": 120, "model_loaded": false, "model_mode": "rule_based"}
+  "debug": {
+    "product_hits": 2,
+    "finance_hits": 1,
+    "sentiment_pos": 0,
+    "sentiment_neg": 1,
+    "labels_source": "rule_based",
+    "model_mode": "rule_based",
+    "text_length": 20,
+    "model_loaded": false
+  }
 }
 ```
 
